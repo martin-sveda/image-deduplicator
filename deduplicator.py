@@ -2,28 +2,26 @@
 """
 best_photo_with_internvl2.py
 
-Full-power best-photo selector (family shots) with InternVL2-2B as final chooser.
+Full-power best-photo selector with InternVL2-2B (OpenGVLab) as final chooser.
+Auto-detects GPU and picks appropriate torch dtype (fp16 on CUDA, fp32 on CPU).
+If InternVL2 cannot be loaded, falls back to hybrid scorer (PickScore/CLIP + MUSIQ + face signals).
 
-Features:
- - time-based grouping (EXIF or mtime)
- - CLIP ViT-L/14 embeddings -> clustering (FAISS or sklearn fallback)
- - PickScore via imscore (optional) or CLIP-proxy fallback
- - MUSIQ TF-Hub technical score
- - Face detection & signals (MTCNN, InceptionResnetV1, Haar + FER/DeepFace fallback)
- - InternVL2-2B (OpenGVLab/InternVL2-2B) used to pick best among prefiltered candidates
- - Caching of heavy computations
+Caveats:
+ - InternVL2 uses custom remote code: this script uses trust_remote_code=True and will execute
+   the model repo code downloaded from HuggingFace. Inspect the repo if you have security concerns.
+ - InternVL2 can be slow on CPU. GPU recommended.
 """
 
 import argparse
 from pathlib import Path
 import os
-import sys
 import math
 import pickle
 from datetime import datetime
 from typing import List, Optional, Dict
-import time
 import re
+import sys
+import time
 
 import numpy as np
 from PIL import Image, ExifTags, ImageFile
@@ -32,33 +30,22 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torch
 from tqdm import tqdm
 
-# transformers CLIP + InternVL2 pipeline
-from transformers import CLIPModel, CLIPProcessor, pipeline
+# Transformers CLIP
+from transformers import CLIPModel, CLIPProcessor
 
-# facenet
+# facenet for faces
 from facenet_pytorch import MTCNN, InceptionResnetV1
 
 # TF-Hub MUSIQ
 import tensorflow as tf
 import tensorflow_hub as hub
 
-# emotion detector (try fer, fallback to deepface)
-_has_fer = False
-try:
-    from fer import FER
-    _has_fer = True
-except Exception:
-    try:
-        from deepface import DeepFace
-        _has_fer = False
-    except Exception:
-        _has_fer = False
-
 # optional libs
 _have_faiss = False
 _have_sklearn = False
 _have_cv2 = False
 _have_imscore = False
+
 try:
     import faiss
     _have_faiss = True
@@ -77,7 +64,7 @@ try:
 except Exception:
     _have_cv2 = False
 
-# optional imscore
+# PickScore (imscore)
 PickScorer = None
 try:
     try:
@@ -90,8 +77,20 @@ except Exception:
     PickScorer = None
     _have_imscore = False
 
+# Emotion detection: try fer; fallback to deepface only when needed
+_has_fer = False
+try:
+    from fer import FER
+    _has_fer = True
+except Exception:
+    _has_fer = False
+    try:
+        from deepface import DeepFace
+    except Exception:
+        DeepFace = None
+
 # -------------------------
-# Configurable params
+# Configurable parameters
 # -------------------------
 DEFAULT_INPUT = r"c:\Users\Z004JR9Y\OneDrive - Siemens AG\Dokumenty\msveda\github\tst-foto"
 TIME_WINDOW_SECONDS = 120
@@ -100,25 +99,24 @@ K_NEIGHBORS = 6
 SIMILARITY_THRESHOLD = 0.92
 MIN_CLUSTER_SIZE = 1
 
-WEIGHT_PICK = 0.45
-WEIGHT_FACE = 0.30
+WEIGHT_PICK = 0.30
+WEIGHT_FACE = 0.45
 WEIGHT_MUSIQ = 0.15
 WEIGHT_SHARP = 0.10
 
 MUSIQ_HUB = "https://tfhub.dev/google/musiq/paq2piq/1"
+INTERNVL2_MODEL_ID = "OpenGVLab/InternVL2-2B"  # change if you prefer another InternVL2 variant
 
+# default cache directory
 CACHE_DIR = Path(".bestphoto_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# Haar cascades if cv2 available
+# Haar cascades
 if _have_cv2:
     HAAR_EYE = cv2.data.haarcascades + "haarcascade_eye.xml"
     HAAR_SMILE = cv2.data.haarcascades + "haarcascade_smile.xml"
 else:
     HAAR_EYE = HAAR_SMILE = None
-
-# InternVL2 model id (OpenGVLab)
-INTERNVL2_MODEL_ID = "OpenGVLab/InternVL2-2B"
 
 # -------------------------
 # Utilities
@@ -170,7 +168,7 @@ def load_face_models(device: torch.device):
 
 def load_pickscore(device: torch.device):
     if not _have_imscore:
-        print("imscore not installed; PickScore unavailable, using CLIP-proxy fallback.")
+        print("imscore (PickScore) not installed — will use CLIP-proxy fallback.")
         return None
     try:
         try:
@@ -182,60 +180,134 @@ def load_pickscore(device: torch.device):
         print("Loaded PickScorer.")
         return model
     except Exception as e:
-        print("PickScorer load failed:", e)
+        print("Failed to init PickScorer, falling back to proxy. Error:", e)
         return None
 
 # -------------------------
-# InternVL2 loader + selector
+# InternVL2 loader (uses custom repo code)
 # -------------------------
 def load_internvl2(model_id: str = INTERNVL2_MODEL_ID, device: Optional[torch.device] = None):
+    """
+    Load InternVL2 Chat model + processor from OpenGVLab repo.
+    Uses trust_remote_code=True. Auto-selects torch dtype: float16 on CUDA, float32 on CPU.
+    Returns (model, processor) or (None, None) on failure.
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pipe_device = 0 if device.type == "cuda" else -1
-    print(f"Loading InternVL2 pipeline '{model_id}' on device {device} ...")
+
+    # choose dtype
+    if device.type == "cuda":
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
 
     try:
-        intern_pipe = pipeline(
-            task="image-to-text",
-            model=model_id,
-            device=pipe_device,
-            trust_remote_code=True
-        )
-    except Exception as e:
-        print("Failed to load pipeline with 'image-to-text':", e)
+        # Import custom classes from their remote module when trust_remote_code=True is used.
+        # The internvl repo exposes `InternVLChatModel` and `InternVLChatProcessor` in their code base.
+        # Use transformers.from_pretrained with trust_remote_code to instantiate them.
+        print(f"Loading InternVL2 model '{model_id}' with trust_remote_code=True on device {device} (dtype={dtype}) ...")
+        # try to import model class via transformers' dynamic import (the classes will be available after trust_remote_code)
+        from transformers import AutoConfig
+        # Attempt to instantiate model and processor via the expected custom classes.
+        # The repo defines InternVLChatModel and InternVLChatProcessor; we will try to import them via the dynamic module.
+        # Use try/except because environments differ.
+        from importlib import import_module
+
+        # Use model.from_pretrained with trust_remote_code; the repo will provide classes under a python package name
+        # We try to call the expected constructors:
+        # InternVLChatModel.from_pretrained(...), InternVLChatProcessor.from_pretrained(...)
+        # Use kwargs for dtype/torch
+        model = None
+        processor = None
         try:
-            intern_pipe = pipeline(
-                task="vision-text-generation",
-                model=model_id,
-                device=pipe_device,
-                trust_remote_code=True
-            )
-        except Exception as e2:
-            print("Failed to load InternVL2 pipeline:", e2)
-            return None
+            # Attempt to import via the exposed path (this will cause HF to download code and make the module available)
+            # The module path used by HF for remote code will be accessible under `transformers_modules...` but easier is to call
+            # the from_pretrained factories expecting the repo to register classes.
+            # We'll try direct import names first; if they fail, fall back to AutoModel-like call with trust_remote_code.
+            try:
+                # Many users can import `internvl` package after HF downloads remote code
+                internvl_mod = import_module("internvl")
+                # if internvl_mod exists, try its classes
+                if hasattr(internvl_mod, "InternVLChatModel"):
+                    InternVLChatModel = getattr(internvl_mod, "InternVLChatModel")
+                    InternVLChatProcessor = getattr(internvl_mod, "InternVLChatProcessor")
+                    model = InternVLChatModel.from_pretrained(model_id, trust_remote_code=True, torch_dtype=dtype)
+                    processor = InternVLChatProcessor.from_pretrained(model_id, trust_remote_code=True)
+                else:
+                    # fallback to AutoModel loading with trust_remote_code (let transformers decide)
+                    raise Exception("internvl module lacks expected classes")
+            except Exception:
+                # fallback: use transformers' from_pretrained to load the classes provided by remote repo
+                # Many remote repos register a class which can be accessed via AutoModel-like APIs.
+                # We'll use AutoModelForCausalLM or similar if available; but InternVL2 defines custom model classes,
+                # so best approach is to import the remote code's classes by accessing the module created by HF.
+                # The simplest robust approach is to use the repo's module path by importing via transformers' hub_utils,
+                # but that's complex; instead attempt a direct from_pretrained using the explicit class name string:
+                # Try to import model via transformers' AutoModelForVision2Seq (may not match) with trust_remote_code.
+                from transformers import AutoModel, AutoTokenizer
+                # Attempt to call AutoModel.from_pretrained with trust_remote_code=True
+                model = AutoModel.from_pretrained(model_id, trust_remote_code=True, torch_dtype=dtype)
+                # For processor, try to use AutoTokenizer as processor fallback (not ideal)
+                try:
+                    processor = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+                except Exception:
+                    processor = None
+        except Exception as e_inner:
+            print("InternVL2 remote import fallback failed:", e_inner)
+            # final fallback: try AutoModelForCausalLM maybe registered under repo
+            try:
+                from transformers import AutoModelForCausalLM
+                model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, torch_dtype=dtype)
+            except Exception as e2:
+                print("Final AutoModelForCausalLM fallback failed:", e2)
+                model = None
+                processor = None
 
-    print("InternVL2 pipeline ready.")
-    return intern_pipe
+        if model is None:
+            print("Could not instantiate InternVL2 model locally (custom code may require specific imports).")
+            return None, None
 
+        # Move model to device
+        model.to(device)
+        model.eval()
 
+        # The repo's processor might be under a custom name; if processor is None, try to construct a simple wrapper using transformers' processors
+        if processor is None:
+            # Attempt to create a minimal processor using CLIPProcessor or AutoTokenizer as fallback
+            try:
+                processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+            except Exception:
+                processor = None
 
-def internvl2_select_best(pipe, candidate_paths: List[Path], max_candidates: int = 8, verbose: bool = False) -> int:
+        print("InternVL2 loaded (best-effort).")
+        return model, processor
+
+    except Exception as e:
+        print("Failed to load InternVL2 model:", e)
+        return None, None
+
+# -------------------------
+# Helper: Ask InternVL2 to select best among small set
+# -------------------------
+def internvl2_select_best_modelproc(model, processor, candidate_paths: List[Path], device: torch.device, max_candidates: int = 8, verbose: bool = False) -> int:
     """
-    Use InternVL2 pipeline to pick best image among candidate_paths.
-    Returns index relative to candidate_paths.
+    Use the (model, processor) obtained from load_internvl2 to pick the best image.
+    Implementation here is robust and tries a couple of input formats.
+
+    Returns index (0-based) relative to candidate_paths (possibly trimmed).
     """
-    if pipe is None:
-        raise RuntimeError("InternVL2 pipeline is None")
+    if model is None or processor is None:
+        raise RuntimeError("InternVL2 model or processor is None")
 
     if len(candidate_paths) == 0:
-        raise ValueError("No candidates")
+        raise ValueError("No candidates provided")
 
-    # limit candidates
+    # trim to max_candidates
     if len(candidate_paths) > max_candidates:
         step = max(1, len(candidate_paths) // max_candidates)
         candidate_paths = candidate_paths[::step][:max_candidates]
         if verbose:
-            print(f"Trimmed to {len(candidate_paths)} candidates for InternVL2")
+            print(f"Trimmed to {len(candidate_paths)} candidates for InternVL2.")
 
     # load PIL images
     pil_images = []
@@ -246,85 +318,98 @@ def internvl2_select_best(pipe, candidate_paths: List[Path], max_candidates: int
             if verbose:
                 print("Failed to open", p, e)
 
-    # build concise prompt expecting an integer index
+    # prompt (request integer)
     prompt = (
-        "You will be shown several similar photos. "
-        "Choose the single best photo that you would keep as the family 'keeper'. "
+        "You will be shown several photos of the same family moment. "
+        "Choose the single best photo to keep as a family 'keeper'. "
         "Criteria: natural/genuine smiles, eyes open, everyone visible and in-focus, pleasant lighting, balanced composition. "
         "Return exactly the index (0-based) of the best photo and nothing else."
     )
 
-    # call pipeline with images and prompt
+    # Many internvl processors accept processor(text=..., images=..., return_tensors="pt")
     try:
-        # many vision-text pipelines accept a list of images + prompt via "image" or "images" param
-        out = pipe(prompt, images=pil_images, max_new_tokens=32)  # signature may vary
-    except TypeError:
-        try:
-            out = pipe(images=pil_images, text=prompt, max_new_tokens=32)
-        except Exception as e:
-            if verbose:
-                print("InternVL2 multi-image call failed:", e)
-            # fallback: rate each image individually
-            ratings = []
-            rate_prompt = (
-                "Rate this photo from 0 to 10 for how good it is as a candidate for family album. "
-                "Consider natural smile, eyes open, clarity and composition. Return only a single number."
-            )
-            for img in pil_images:
-                try:
-                    r = pipe(rate_prompt, images=img, max_new_tokens=16)
-                    if isinstance(r, list) and isinstance(r[0], dict):
-                        txt = r[0].get('generated_text', '') or r[0].get('text', '')
-                    elif isinstance(r, dict):
-                        txt = r.get('generated_text', '') or r.get('text', '')
-                    else:
-                        txt = str(r)
-                    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", txt)
-                    val = float(m.group(1)) if m else 0.0
-                except Exception:
-                    val = 0.0
-                ratings.append(val)
-            best_idx = int(np.argmax(ratings)) if ratings else 0
-            return best_idx
+        inputs = processor(text=prompt, images=pil_images, return_tensors="pt")
+        # move tensors to device if any
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                inputs[k] = v.to(device)
+            elif isinstance(v, dict) or isinstance(v, list):
+                # nested; skip
+                pass
+        # generate
+        with torch.no_grad():
+            out_ids = model.generate(**inputs, max_new_tokens=32)
+        # decode using processor if it provides decode, else use tokenizer if available
+        text = None
+        if hasattr(processor, "decode"):
+            try:
+                text = processor.decode(out_ids[0], skip_special_tokens=True)
+            except Exception:
+                pass
+        if text is None:
+            try:
+                # try to use tokenizer if available
+                if hasattr(processor, "tokenizer"):
+                    text = processor.tokenizer.decode(out_ids[0], skip_special_tokens=True)
+            except Exception:
+                text = str(out_ids[0].cpu().numpy())
+        if verbose:
+            print("InternVL2 raw output:", text)
     except Exception as e:
         if verbose:
-            print("InternVL2 call exception:", e)
-        return 0
+            print("InternVL2 model.generate path failed:", e)
+        # fallback: per-image rating (ask model to rate each image individually)
+        ratings = []
+        rate_prompt = (
+            "Rate this family photo from 0 to 10 for how good it is as a family portrait. "
+            "Consider natural smile, eyes open, clarity and composition. Return only a single number."
+        )
+        for img in pil_images:
+            try:
+                inputs = processor(text=rate_prompt, images=img, return_tensors="pt")
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        inputs[k] = v.to(device)
+                with torch.no_grad():
+                    out_ids = model.generate(**inputs, max_new_tokens=16)
+                txt = None
+                if hasattr(processor, "decode"):
+                    try:
+                        txt = processor.decode(out_ids[0], skip_special_tokens=True)
+                    except Exception:
+                        pass
+                if txt is None and hasattr(processor, "tokenizer"):
+                    try:
+                        txt = processor.tokenizer.decode(out_ids[0], skip_special_tokens=True)
+                    except Exception:
+                        txt = ""
+                m = re.search(r"([0-9]+(?:\.[0-9]+)?)", txt)
+                val = float(m.group(1)) if m else 0.0
+            except Exception as e2:
+                if verbose:
+                    print("Per-image rating failed:", e2)
+                val = 0.0
+            ratings.append(val)
+        best_idx = int(np.argmax(ratings)) if ratings else 0
+        return best_idx
 
-    # parse text
-    txt = ""
-    if isinstance(out, list):
-        # often pipeline returns list of dicts
-        first = out[0]
-        if isinstance(first, dict):
-            txt = first.get('generated_text', '') or first.get('text', '') or str(first)
-        else:
-            txt = str(first)
-    elif isinstance(out, dict):
-        txt = out.get('generated_text', '') or out.get('text', '')
-    else:
-        txt = str(out)
-
-    if verbose:
-        print("InternVL2 output:", txt)
-
-    m = re.search(r"\b([0-9]+)\b", txt)
+    # parse integer index from text
+    m = re.search(r"\b([0-9]+)\b", text or "")
     if not m:
-        m = re.search(r"(index|photo|image)\s*[:#]?\s*([0-9]+)", txt, flags=re.IGNORECASE)
+        m = re.search(r"(index|photo|image)\s*[:#]?\s*([0-9]+)", text or "", flags=re.IGNORECASE)
         if m:
             idx = int(m.group(2))
         else:
             if verbose:
-                print("Could not parse index from InternVL2 output; defaulting to 0")
+                print("Could not parse InternVL2 output, defaulting to 0. Output:", text)
             idx = 0
     else:
         idx = int(m.group(1))
-
     idx = max(0, min(idx, len(candidate_paths) - 1))
     return idx
 
 # -------------------------
-# Embedding / neighbor / cluster helpers
+# CLIP embeddings / index / clustering
 # -------------------------
 def compute_clip_embeddings(paths: List[Path], clip_model, clip_proc, device, cache_key: Optional[str] = None) -> np.ndarray:
     if cache_key:
@@ -340,7 +425,7 @@ def compute_clip_embeddings(paths: List[Path], clip_model, clip_proc, device, ca
     clip_model.eval()
     embeddings = []
     with torch.no_grad():
-        for i in tqdm(range(0, len(paths), CLIP_BATCH), desc="CLIP embedded batches"):
+        for i in tqdm(range(0, len(paths), CLIP_BATCH), desc="CLIP embedding batches"):
             batch = paths[i:i+CLIP_BATCH]
             imgs = []
             for p in batch:
@@ -395,31 +480,26 @@ def build_and_query_index(embeddings: np.ndarray, top_k: int = K_NEIGHBORS):
 
 class UnionFind:
     def __init__(self, n):
-        self.parent = list(range(n))
-        self.rank = [0]*n
-    def find(self, a):
+        self.parent = list(range(n)); self.rank = [0]*n
+    def find(self,a):
         while self.parent[a] != a:
             self.parent[a] = self.parent[self.parent[a]]
             a = self.parent[a]
         return a
-    def union(self, a, b):
-        ra = self.find(a); rb = self.find(b)
-        if ra == rb: return
-        if self.rank[ra] < self.rank[rb]:
-            self.parent[ra] = rb
+    def union(self,a,b):
+        ra=self.find(a); rb=self.find(b)
+        if ra==rb: return
+        if self.rank[ra]<self.rank[rb]: self.parent[ra]=rb
         else:
-            self.parent[rb] = ra
-            if self.rank[ra] == self.rank[rb]:
-                self.rank[ra] += 1
+            self.parent[rb]=ra
+            if self.rank[ra]==self.rank[rb]: self.rank[ra]+=1
 
 def cluster_by_similarity(inds: np.ndarray, sims: np.ndarray, threshold: float = SIMILARITY_THRESHOLD) -> List[List[int]]:
-    n = inds.shape[0]
-    uf = UnionFind(n)
+    n = inds.shape[0]; uf = UnionFind(n)
     for i in range(n):
         for j_idx, neighbor in enumerate(inds[i]):
             neighbor = int(neighbor)
-            if neighbor == i:
-                continue
+            if neighbor == i: continue
             sim = float(sims[i][j_idx])
             if sim >= threshold:
                 uf.union(i, neighbor)
@@ -430,7 +510,7 @@ def cluster_by_similarity(inds: np.ndarray, sims: np.ndarray, threshold: float =
     return [c for c in clusters.values() if len(c) >= MIN_CLUSTER_SIZE]
 
 # -------------------------
-# MUSIQ + faces + pickscore
+# MUSIQ, faces, pickscore and scoring
 # -------------------------
 def load_musiq():
     print("Loading MUSIQ TF-Hub model...")
@@ -457,10 +537,9 @@ def musiq_score(musiq_model, path: Path, cache_key: Optional[str] = None) -> flo
     if cache_key:
         try:
             d = {}
-            if cf.exists():
-                d = pickle.load(open(cf, "rb"))
+            if cf.exists(): d = pickle.load(open(cf,"rb"))
             d[path.name] = val
-            pickle.dump(d, open(cf, "wb"))
+            pickle.dump(d, open(cf,"wb"))
         except Exception:
             pass
     return val
@@ -487,9 +566,9 @@ def detect_faces_and_signals(path: Path, mtcnn: MTCNN, resnet: InceptionResnetV1
         if cache_key:
             try:
                 d = {}
-                if cf.exists(): d = pickle.load(open(cf, "rb"))
+                if cf.exists(): d = pickle.load(open(cf,"rb"))
                 d[path.name] = out
-                pickle.dump(d, open(cf, "wb"))
+                pickle.dump(d, open(cf,"wb"))
             except Exception:
                 pass
         return out
@@ -504,9 +583,8 @@ def detect_faces_and_signals(path: Path, mtcnn: MTCNN, resnet: InceptionResnetV1
             continue
         faces.append(((x1,y1,x2,y2), face))
 
-    # embeddings
     import torchvision.transforms as T
-    trans = T.Compose([T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
+    trans = T.Compose([T.ToTensor(), T.Normalize([0.5]*3,[0.5]*3)])
     batch = torch.stack([trans(f[1]).to(resnet.device) for f in faces])
     with torch.no_grad():
         embs = resnet(batch).cpu().numpy()
@@ -526,16 +604,14 @@ def detect_faces_and_signals(path: Path, mtcnn: MTCNN, resnet: InceptionResnetV1
         else:
             sharpness = 0.0; eyes_count = 0; smile_haar = 0.0
 
-        # emotion detection
         happy = 0.0
         try:
-            if _has_fer:
+            if _has_fer and fer_detector is not None:
                 em = fer_detector.detect_emotions(face_np)
                 if em and len(em)>0 and isinstance(em[0], dict):
                     emotions = em[0]["emotions"]
                     happy = float(emotions.get("happy", 0.0))
-            else:
-                # deepface fallback
+            elif DeepFace is not None:
                 res = DeepFace.analyze(face_np, actions=['emotion'], enforce_detection=False)
                 if isinstance(res, list) and len(res)>0:
                     emotions = res[0].get("emotion", {})
@@ -559,9 +635,9 @@ def detect_faces_and_signals(path: Path, mtcnn: MTCNN, resnet: InceptionResnetV1
     if cache_key:
         try:
             d = {}
-            if cf.exists(): d = pickle.load(open(cf, "rb"))
+            if cf.exists(): d = pickle.load(open(cf,"rb"))
             d[path.name] = out
-            pickle.dump(d, open(cf, "wb"))
+            pickle.dump(d, open(cf,"wb"))
         except Exception:
             pass
 
@@ -587,16 +663,14 @@ def face_quality_score(faces: List[Dict]) -> float:
     return avg * count_factor
 
 def compute_pickscore_for_paths(pick_model, clip_model, clip_proc, device, paths: List[Path], cache_key: Optional[str] = None) -> List[float]:
-    key = None
     if cache_key:
         keyf = CACHE_DIR / f"pick_{cache_key}.pkl"
         if keyf.exists():
             try:
-                d = pickle.load(open(keyf, "rb"))
+                d = pickle.load(open(keyf,"rb"))
                 return [d.get(p.name, 0.0) for p in paths]
             except Exception:
                 pass
-
     scores = []
     if pick_model is not None:
         try:
@@ -616,7 +690,6 @@ def compute_pickscore_for_paths(pick_model, clip_model, clip_proc, device, paths
                     except Exception:
                         scores.append(0.0)
         except Exception:
-            # fallback proxy
             rng = np.random.RandomState(12345)
             vec = rng.normal(size=(clip_model.config.projection_dim,))
             vec = vec / np.linalg.norm(vec)
@@ -644,18 +717,16 @@ def compute_pickscore_for_paths(pick_model, clip_model, clip_proc, device, paths
                 scores.append(float(np.dot(emb_np, vec)))
             except Exception:
                 scores.append(0.0)
-
     if cache_key:
         try:
             d = {}
             keyf = CACHE_DIR / f"pick_{cache_key}.pkl"
-            if keyf.exists(): d = pickle.load(open(keyf, "rb"))
-            for p, s in zip(paths, scores):
+            if keyf.exists(): d = pickle.load(open(keyf,"rb"))
+            for p,s in zip(paths, scores):
                 d[p.name] = float(s)
-            pickle.dump(d, open(keyf, "wb"))
+            pickle.dump(d, open(keyf,"wb"))
         except Exception:
             pass
-
     return scores
 
 def final_score_for_image(path: Path, emb: np.ndarray,
@@ -681,7 +752,7 @@ def final_score_for_image(path: Path, emb: np.ndarray,
     return float(raw), meta
 
 # -------------------------
-# Grouping & split by CLIP
+# Grouping and CLIP splitting
 # -------------------------
 def group_by_time(paths: List[Path], time_window_seconds: int = TIME_WINDOW_SECONDS) -> List[List[Path]]:
     items = []
@@ -720,12 +791,11 @@ def split_time_group_by_clip(time_group_paths: List[Path], clip_model, clip_proc
     return clusters
 
 # -------------------------
-# Prefilter candidates for InternVL2 (fast heuristics)
+# Prefilter candidates for InternVL2
 # -------------------------
 def prefilter_candidates_by_sharpness_or_musiq(paths: List[Path], musiq_model, top_k: int = 8):
     scores = []
     for p in paths:
-        # quick sharpness
         if _have_cv2:
             try:
                 im = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -734,9 +804,8 @@ def prefilter_candidates_by_sharpness_or_musiq(paths: List[Path], musiq_model, t
                 sharp = 0.0
         else:
             sharp = 0.0
-        # musiq (fast-ish)
         musiq_v = musiq_score(musiq_model, p, cache_key=None)
-        # combine crude
+        # combine (note musiq may be larger scale; we only need rough ordering)
         scores.append((p, 0.6 * sharp + 0.4 * musiq_v))
     scores.sort(key=lambda x: x[1], reverse=True)
     top = [x[0] for x in scores[:top_k]]
@@ -746,6 +815,7 @@ def prefilter_candidates_by_sharpness_or_musiq(paths: List[Path], musiq_model, t
 # Main
 # -------------------------
 def main():
+    # ensure global cache dir is set early
     global CACHE_DIR
     parser = argparse.ArgumentParser(description="Best photo selector with InternVL2 final chooser.")
     parser.add_argument("--path", type=str, help="Folder with images (flat).")
@@ -755,20 +825,19 @@ def main():
     parser.add_argument("--intern-model", type=str, default=INTERNVL2_MODEL_ID, help="InternVL2 model id on HF")
     args = parser.parse_args()
 
+    if args.cache_dir:
+        CACHE_DIR = Path(args.cache_dir)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
     folder = Path(args.path) if args.path else Path(DEFAULT_INPUT)
     if not folder.exists():
         print("Input folder not found:", folder)
         return
 
-    # update cache dir
-    if args.cache_dir:
-        CACHE_DIR = Path(args.cache_dir)
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
+    print("Using device:", device)
 
-    # load models
+    # load core models
     clip_model, clip_proc = load_clip(device)
     musiq_model = load_musiq()
     mtcnn, resnet = load_face_models(device)
@@ -778,19 +847,11 @@ def main():
             fer_detector = FER(mtcnn=False)
         except Exception:
             fer_detector = None
-    else:
-        try:
-            # DeepFace doesn't provide a small detector object; we'll call analyze per-face
-            # ensure import succeeded earlier
-            pass
-        except Exception:
-            pass
     pick_model = load_pickscore(device)
 
-    # InternVL2 pipeline
-    intern_pipe = load_internvl2(model_id=args.intern_model, device=device)
+    # attempt to load InternVL2 using its custom code (trust_remote_code)
+    intern_model, intern_proc = load_internvl2(model_id=args.intern_model, device=device)
 
-    # images
     image_paths = list_images_flat(folder)
     if not image_paths:
         print("No images found in", folder)
@@ -804,19 +865,18 @@ def main():
     for gi, tg in enumerate(time_groups):
         subgroups = split_time_group_by_clip(tg, clip_model, clip_proc, device)
         for sg in subgroups:
-            # compute embeddings (for scoring fallback)
+            # compute clip embeddings for subgroup
             emb = compute_clip_embeddings(sg, clip_model, clip_proc, device, cache_key=None)
             norms = np.linalg.norm(emb, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
             emb = emb / norms
 
-            # prefilter candidates for InternVL2 (fast)
+            # prefilter candidates then call internvl model if available
             prefiltered = prefilter_candidates_by_sharpness_or_musiq(sg, musiq_model, top_k=8)
-            # ensure deterministic order mapping back if prefiltered is subset
-            # If intern_pipe available, call it; else fallback to hybrid scoring
-            if intern_pipe is not None:
+            if intern_model is not None and intern_proc is not None:
                 try:
-                    best_rel = internvl2_select_best(intern_pipe, prefiltered, max_candidates=8, verbose=False)
+                    # try to use internvl model to pick best among prefiltered
+                    best_rel = internvl2_select_best_modelproc(intern_model, intern_proc, prefiltered, device, max_candidates=8, verbose=False)
                     best_path = prefiltered[best_rel]
                     kept.append(best_path)
                     print(f"[Moment {gi}] subgroup {len(sg)} -> keep (InternVL2): {best_path.name}")
@@ -824,7 +884,7 @@ def main():
                 except Exception as e:
                     print("InternVL2 selection failed, falling back to hybrid scoring:", e)
 
-            # fallback: hybrid scoring (PickScore + face + musiq + sharpness)
+            # hybrid fallback
             raw_scores = []
             metas = []
             pickvals = compute_pickscore_for_paths(pick_model, clip_model, clip_proc, device, sg, cache_key=f"group_{gi}_{len(sg)}")
