@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-best_photo_qwen2vl.py
+best_photo_phi3.py
 
-CLIP clustering + heuristics + Qwen2-VL final chooser (two-pass reasoning).
+Full-power best-photo selector:
+ - CLIP embeddings + clustering (find visually-similar sets / bursts)
+ - MUSIQ prefilter + sharpness heuristics
+ - Face signals (MTCNN + InceptionResnetV1 + Haar checks + FER/DeepFace optional)
+ - PickScore if installed (fallback to CLIP proxy)
+ - Final selection & short explanation from microsoft/Phi-3-mini-128k-instruct (vision)
+   (two-pass: index -> explanation)
+ - Works on CPU (auto selects dtype), images resized to 512px for Phi-3 inputs.
 
 Usage:
-    python best_photo_qwen2vl.py --path "C:\images" --time-window 60
-
-Notes:
- - Qwen2-VL model id used: "Qwen/Qwen2-VL-2B" (public HF). Change model id to different variant if needed.
- - Script auto-detects CUDA and uses float16 on GPU, float32 on CPU.
- - Heavy computations are cached under .bestphoto_cache by default.
+    python best_photo_phi3.py --path "C:\path\to\images" --time-window 120
 """
 
 import argparse
@@ -31,11 +33,11 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torch
 from tqdm import tqdm
 
-# CLIP (for embeddings & clustering)
+# CLIP for embeddings
 from transformers import CLIPModel, CLIPProcessor
 
-# Qwen2-VL loader (AutoModelForVision2Seq + AutoProcessor)
-from transformers import AutoProcessor, AutoModelForVision2Seq
+# Phi-3 (vision) loader - use AutoModelForCausalLM and AutoProcessor with trust_remote_code
+from transformers import AutoProcessor, AutoModelForCausalLM
 
 # face models
 from facenet_pytorch import MTCNN, InceptionResnetV1
@@ -44,7 +46,7 @@ from facenet_pytorch import MTCNN, InceptionResnetV1
 import tensorflow as tf
 import tensorflow_hub as hub
 
-# optional dependencies
+# optional libs
 _have_faiss = False
 _have_sklearn = False
 _have_cv2 = False
@@ -68,7 +70,7 @@ try:
 except Exception:
     _have_cv2 = False
 
-# optional PickScore (imscore) importer
+# optional PickScore importer
 PickScorer = None
 try:
     try:
@@ -109,7 +111,10 @@ WEIGHT_MUSIQ = 0.20
 WEIGHT_SHARP = 0.10
 
 MUSIQ_HUB = "https://tfhub.dev/google/musiq/paq2piq/1"
-QWEN_MODEL_ID = "Qwen/Qwen2-VL-2B"
+PHI3_MODEL_ID = "microsoft/Phi-3-mini-128k-instruct"
+
+# images resized for Phi-3 (keeps aspect ratio, max side)
+PHI3_MAX_SIDE = 512
 
 CACHE_DIR = Path(".bestphoto_cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -148,6 +153,18 @@ def read_exif_datetime(p: Path) -> Optional[datetime]:
 def file_mtime_datetime(p: Path) -> datetime:
     return datetime.fromtimestamp(p.stat().st_mtime)
 
+def pil_resize_preserve(img: Image.Image, max_side: int) -> Image.Image:
+    w, h = img.size
+    if max(w, h) <= max_side:
+        return img
+    if w >= h:
+        nw = max_side
+        nh = int(h * (max_side / w))
+    else:
+        nh = max_side
+        nw = int(w * (max_side / h))
+    return img.resize((nw, nh), Image.LANCZOS)
+
 # -------------------------
 # Model loaders
 # -------------------------
@@ -158,24 +175,25 @@ def load_clip(device: torch.device):
     clip.eval()
     return clip, proc
 
-def load_qwen2vl(model_id: str = QWEN_MODEL_ID, device: Optional[torch.device] = None):
+def load_phi3_vision(model_id: str = PHI3_MODEL_ID, device: Optional[torch.device] = None):
     """
-    Load Qwen2-VL model and processor. Uses float16 on CUDA, float32 on CPU.
+    Load Phi-3-mini vision model (AutoModelForCausalLM + AutoProcessor with trust_remote_code=True).
+    Uses fp16 on CUDA, fp32 on CPU.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
 
-    print(f"Loading Qwen2-VL ({model_id}) on {device} (dtype={dtype}) ...")
+    print(f"Loading Phi-3 vision ({model_id}) on {device} (dtype={dtype}) ...")
     try:
-        processor = AutoProcessor.from_pretrained(model_id)
-        model = AutoModelForVision2Seq.from_pretrained(model_id, torch_dtype=dtype)
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, trust_remote_code=True)
         model.to(device)
         model.eval()
-        print("Qwen2-VL loaded.")
+        print("Phi-3 vision loaded.")
         return model, processor
     except Exception as e:
-        print("Failed to load Qwen2-VL:", e)
+        print("Failed to load Phi-3 vision model:", e)
         return None, None
 
 def load_musiq():
@@ -313,12 +331,6 @@ def cluster_by_similarity(inds: np.ndarray, sims: np.ndarray, threshold: float =
 # -------------------------
 # MUSIQ, faces, pickscore and scoring
 # -------------------------
-def load_musiq_safe():
-    try:
-        return load_musiq()
-    except Exception:
-        return None
-
 def musiq_score(musiq_model, path: Path, cache_key: Optional[str] = None) -> float:
     if musiq_model is None:
         return 0.0
@@ -395,12 +407,11 @@ def detect_faces_and_signals(path: Path, mtcnn: MTCNN, resnet: InceptionResnetV1
 
         happy = 0.0
         try:
-            if _has_fer:
-                if fer_detector is not None:
-                    em = fer_detector.detect_emotions(face_np)
-                    if em and len(em)>0 and isinstance(em[0], dict):
-                        emotions = em[0]["emotions"]
-                        happy = float(emotions.get("happy", 0.0))
+            if _has_fer and fer_detector is not None:
+                em = fer_detector.detect_emotions(face_np)
+                if em and len(em)>0 and isinstance(em[0], dict):
+                    emotions = em[0]["emotions"]
+                    happy = float(emotions.get("happy", 0.0))
             elif DeepFace is not None:
                 res = DeepFace.analyze(face_np, actions=['emotion'], enforce_detection=False)
                 if isinstance(res, list) and len(res)>0:
@@ -534,66 +545,72 @@ def final_score_for_image(path: Path, emb: np.ndarray,
     return float(raw), meta
 
 # -------------------------
-# Qwen2-VL selection (two-pass)
+# Phi-3 selection (two-pass)
 # -------------------------
-def qwen2vl_select_best(model, processor, candidate_paths: List[Path], device: torch.device, max_candidates: int = 8, verbose: bool = False) -> Tuple[int, str]:
+def phi3_select_best(model, processor, candidate_paths: List[Path], device: torch.device, max_candidates: int = 8, verbose: bool = False) -> Tuple[int, str]:
     """
-    Two-pass selection using Qwen2-VL:
-      - pass 1: ask for index among candidates
-      - pass 2: generate short explanation about chosen image
-    Returns (best_index, explanation)
+    Use Phi-3-mini vision to choose best photo among candidate_paths.
+    Two pass:
+      - pass1: ask for index (0-based)
+      - pass2: ask for short explanation about chosen image
+    Images are resized (max side PHI3_MAX_SIDE) before sending to model for speed.
     """
     if model is None or processor is None:
-        raise RuntimeError("Qwen2-VL model/processor missing")
+        raise RuntimeError("Phi-3 model/processor missing")
 
     if len(candidate_paths) == 0:
         return 0, "No candidates"
 
-    # trim
+    # trim candidates to max_candidates evenly
     if len(candidate_paths) > max_candidates:
         step = max(1, len(candidate_paths) // max_candidates)
         candidate_paths = candidate_paths[::step][:max_candidates]
         if verbose:
-            print(f"Trimmed candidates to {len(candidate_paths)} for Qwen")
+            print(f"Phi-3: trimmed to {len(candidate_paths)} candidates")
 
-    # load PIL images list
+    # load+resize images
     pil_imgs = []
     for p in candidate_paths:
         try:
-            pil_imgs.append(Image.open(p).convert("RGB"))
+            img = Image.open(p).convert("RGB")
+            img = pil_resize_preserve(img, PHI3_MAX_SIDE)
+            pil_imgs.append(img)
         except Exception:
             pil_imgs.append(None)
 
-    # Pass 1: pick index
+    # PASS 1: ask for index
     pick_prompt = (
-        "You will be shown several similar photos. Select the single best photo. "
-        "Criteria: natural genuine smile, eyes open, good posture, face clarity, and pleasant lighting. "
-        "Respond only with the index number (0-based)."
+        "You will be shown several similar family photos. Choose the single best photo to keep. "
+        "Criteria: natural/genuine smile, eyes open, clear faces (in focus), good lighting, and authentic mood. "
+        "Return ONLY the index (0-based) of the best image, without any other text."
     )
+
     best_idx = 0
     try:
+        # build inputs with processor; processor will pack images + text
         inputs = processor(text=pick_prompt, images=pil_imgs, return_tensors="pt")
-        # move to device
-        def _to_device(obj):
-            if isinstance(obj, dict):
-                return {k: _to_device(v) for k, v in obj.items()}
-            if torch.is_tensor(obj):
-                return obj.to(device)
-            return obj
-        inputs = _to_device(inputs)
+        # move tensors to device
+        def _move_to_device(x):
+            if isinstance(x, dict):
+                return {k: _move_to_device(v) for k, v in x.items()}
+            if torch.is_tensor(x):
+                return x.to(device)
+            return x
+        inputs = _move_to_device(inputs)
+
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=32)
+            out_ids = model.generate(**inputs, max_new_tokens=32)
+
         # decode
         try:
-            txt = processor.batch_decode(out, skip_special_tokens=True)[0]
+            txt = processor.batch_decode(out_ids, skip_special_tokens=True)[0]
         except Exception:
-            # fallback decode
             try:
-                txt = processor.tokenizer.decode(out[0], skip_special_tokens=True)
+                txt = processor.tokenizer.decode(out_ids[0], skip_special_tokens=True)
             except Exception:
-                txt = str(out[0].cpu().numpy())
+                txt = str(out_ids[0].cpu().numpy())
         if verbose:
-            print("Qwen pick raw:", txt)
+            print("Phi-3 pick raw:", txt)
         m = re.search(r"\b([0-9]+)\b", txt)
         if m:
             best_idx = int(m.group(1))
@@ -602,28 +619,22 @@ def qwen2vl_select_best(model, processor, candidate_paths: List[Path], device: t
         best_idx = max(0, min(best_idx, len(candidate_paths) - 1))
     except Exception as e:
         if verbose:
-            print("Qwen pick failed:", e)
-        return 0, "Qwen2-VL pick failed"
+            print("Phi-3 pick failed:", e)
+        return 0, "Phi-3 pick failed"
 
-    # Pass 2: explanation (on single chosen image)
+    # PASS 2: explanation
     explanation = ""
     try:
         exp_prompt = (
-            f"I selected photo index {best_idx} as the best. Briefly explain (1-3 sentences) why it's the best choice. "
-            "Mention smile, eyes, focus, lighting, and overall authenticity if relevant."
+            f"I selected photo index {best_idx} as the best. Briefly (2-4 short sentences) explain WHY this image is the best choice. "
+            "Focus on smile, eyes, posture, lighting, clarity and overall authenticity."
         )
+        # single image (resized)
         img = pil_imgs[best_idx]
         inputs2 = processor(text=exp_prompt, images=[img], return_tensors="pt")
-        # move
-        def _to_device2(obj):
-            if isinstance(obj, dict):
-                return {k: _to_device2(v) for k, v in obj.items()}
-            if torch.is_tensor(obj):
-                return obj.to(device)
-            return obj
-        inputs2 = _to_device2(inputs2)
+        inputs2 = _move_to_device(inputs2)
         with torch.no_grad():
-            out2 = model.generate(**inputs2, max_new_tokens=128)
+            out2 = model.generate(**inputs2, max_new_tokens=96)
         try:
             explanation = processor.batch_decode(out2, skip_special_tokens=True)[0].strip()
         except Exception:
@@ -632,12 +643,12 @@ def qwen2vl_select_best(model, processor, candidate_paths: List[Path], device: t
             except Exception:
                 explanation = ""
         if verbose:
-            print("Qwen explanation raw:", explanation)
+            print("Phi-3 explanation raw:", explanation)
         if not explanation or len(explanation.strip()) < 6:
             explanation = ""
     except Exception as e:
         if verbose:
-            print("Qwen explanation failed:", e)
+            print("Phi-3 explanation failed:", e)
         explanation = ""
 
     return best_idx, explanation if explanation else "No explanation generated"
@@ -704,17 +715,16 @@ def split_time_group_by_clip(time_group_paths: List[Path], clip_model, clip_proc
 # -------------------------
 def main():
     global CACHE_DIR
-    
-    parser = argparse.ArgumentParser(description="Best photo selector with Qwen2-VL final chooser")
+    parser = argparse.ArgumentParser(description="Best photo selector with Phi-3 vision final chooser")
     parser.add_argument("--path", type=str, help="Folder with images (flat).")
     parser.add_argument("--time-window", type=int, default=TIME_WINDOW_SECONDS)
     parser.add_argument("--cache-dir", type=str, default=str(CACHE_DIR))
     parser.add_argument("--dry", action="store_true")
-    parser.add_argument("--qwen-model", type=str, default=QWEN_MODEL_ID)
+    parser.add_argument("--phi3-model", type=str, default=PHI3_MODEL_ID)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    
+
     if args.cache_dir:
         CACHE_DIR = Path(args.cache_dir)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -727,10 +737,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
-    # load models
+    # load core models
     clip_model, clip_proc = load_clip(device)
-    qwen_model, qwen_proc = load_qwen2vl(model_id=args.qwen_model, device=device)
-    musiq_model = load_musiq_safe()
+    phi3_model, phi3_proc = load_phi3_vision(model_id=args.phi3_model, device=device)
+    musiq_model = load_musiq()
     mtcnn, resnet = load_face_models(device)
     fer_detector = None
     if _has_fer:
@@ -754,27 +764,28 @@ def main():
     for gi, tg in enumerate(time_groups):
         subgroups = split_time_group_by_clip(tg, clip_model, clip_proc, device)
         for sg in subgroups:
+            # compute CLIP embeddings for subgroup
             emb = compute_clip_embeddings(sg, clip_model, clip_proc, device, cache_key=None)
             norms = np.linalg.norm(emb, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
             emb = emb / norms
 
+            # prefilter and call Phi-3 if available
             prefiltered = prefilter_candidates_by_sharpness_or_musiq(sg, musiq_model, top_k=8)
 
-            # Try Qwen2-VL selection
-            if qwen_model is not None and qwen_proc is not None:
+            if phi3_model is not None and phi3_proc is not None:
                 try:
-                    best_rel, reason = qwen2vl_select_best(qwen_model, qwen_proc, prefiltered, device, max_candidates=8, verbose=args.verbose)
+                    best_rel, reason = phi3_select_best(phi3_model, phi3_proc, prefiltered, device, max_candidates=8, verbose=args.verbose)
                     best_path = prefiltered[best_rel]
-                    print(f"[Moment {gi}] keep (Qwen): {best_path.name}")
+                    print(f"[Moment {gi}] keep (Phi-3): {best_path.name}")
                     if args.verbose:
                         print("Reason:", reason)
                     kept.append((best_path, reason))
                     continue
                 except Exception as e:
-                    print("Qwen2-VL selection failed; falling back to hybrid. Error:", e)
+                    print("Phi-3 selection failed; falling back to hybrid. Error:", e)
 
-            # Hybrid fallback scoring
+            # hybrid fallback scoring
             raw_scores = []
             metas = []
             pickvals = compute_pickscore_for_paths(pick_model, clip_model, clip_proc, device, sg, cache_key=f"group_{gi}_{len(sg)}")
